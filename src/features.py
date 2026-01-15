@@ -1,0 +1,357 @@
+"""feature extraction utilities used by the baseline."""
+
+from __future__ import annotations
+
+import os
+from glob import glob
+from typing import List, Tuple
+
+import h5py
+import librosa
+import numpy as np
+import pandas as pd
+
+pd.options.mode.chained_assignment = None
+
+
+def _time_to_frame(df: pd.DataFrame, fps: float) -> Tuple[List[int], List[int]]:
+    # add a small margin around each event
+    df.loc[:, 'Starttime'] = df['Starttime'] - 0.025
+    df.loc[:, 'Endtime'] = df['Endtime'] + 0.025
+    start_time = [int(np.floor(start * fps)) for start in df['Starttime']]
+    end_time = [int(np.floor(end * fps)) for end in df['Endtime']]
+    return start_time, end_time
+
+
+def _create_patches(
+    df_pos: pd.DataFrame,
+    pcen: np.ndarray,
+    glob_cls_name: str,
+    file_name: str,
+    hf: h5py.File,
+    seg_len: int,
+    hop_seg: int,
+    fps: float,
+) -> List[str]:
+    # chunk the time-freq rep into fixed windows
+    if len(hf['features'][:]) == 0:
+        file_index = 0
+    else:
+        file_index = len(hf['features'][:])
+
+    start_time, end_time = _time_to_frame(df_pos, fps)
+
+    # for csv files with a column name call, use the global class name
+    if 'CALL' in df_pos.columns:
+        labels_per_row = [[glob_cls_name] for _ in range(len(start_time))]
+    else:
+        labels_per_row = []
+        for _, row in df_pos.iterrows():
+            row_labels = [col for col, val in row.items() if val == 'POS']
+            labels_per_row.append(row_labels)
+
+    label_list: List[str] = []
+    for index in range(len(start_time)):
+        str_ind = max(start_time[index], 0)
+        end_ind = min(end_time[index], pcen.shape[0])
+        if end_ind <= str_ind:
+            continue
+        row_labels = labels_per_row[index]
+
+        def _pad_to_len(arr: np.ndarray, target_len: int) -> np.ndarray | None:
+            # make sure every patch matches seg_len
+            if arr.shape[0] == 0:
+                return None
+            if arr.shape[0] < target_len:
+                repeat_num = int(target_len / arr.shape[0]) + 1
+                arr = np.tile(arr, (repeat_num, 1))
+            return arr[:target_len]
+
+        def _append_patch(patch: np.ndarray):
+            nonlocal file_index
+            for label in row_labels:
+                hf['features'].resize((file_index + 1, seg_len, patch.shape[1]))
+                hf['features'][file_index] = patch
+                label_list.append(label)
+                file_index += 1
+
+        # extract segments with hop_seg stride
+        if end_ind - str_ind > seg_len:
+            shift = 0
+            while end_ind - (str_ind + shift) > seg_len:
+                pcen_patch = pcen[int(str_ind + shift):int(str_ind + shift + seg_len)]
+                pcen_patch = _pad_to_len(pcen_patch, seg_len)
+                if pcen_patch is None:
+                    shift = shift + hop_seg
+                    continue
+                _append_patch(pcen_patch)
+                shift = shift + hop_seg
+
+            pcen_patch_last = pcen[end_ind - seg_len:end_ind]
+            pcen_patch_last = _pad_to_len(pcen_patch_last, seg_len)
+            if pcen_patch_last is not None:
+                _append_patch(pcen_patch_last)
+        else:
+            # if patch is shorter than seg_len, tile it
+            pcen_patch = pcen[str_ind:end_ind]
+            if pcen_patch.shape[0] == 0:
+                print(pcen_patch.shape[0])
+                print("The patch is of 0 length")
+                continue
+
+            pcen_patch_new = _pad_to_len(pcen_patch, seg_len)
+            if pcen_patch_new is not None:
+                _append_patch(pcen_patch_new)
+
+    print("Total files created : {}".format(file_index))
+    return label_list
+
+
+class FeatureExtractor:
+    # pcen mel feature extractor
+
+    def __init__(self, conf):
+        self.sr = conf.features.sr
+        self.n_fft = conf.features.n_fft
+        self.hop = conf.features.hop_mel
+        self.n_mels = conf.features.n_mels
+        self.n_mfcc = int(conf.features.get("n_mfcc", 0))
+        self.use_delta_mfcc = bool(conf.features.get("use_delta_mfcc", False))
+        self.fmax = conf.features.fmax
+
+    def extract_feature(self, audio: np.ndarray) -> np.ndarray:
+        # librosa>=0.10 enforces keyword-only args
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=self.sr,
+            n_fft=self.n_fft,
+            hop_length=self.hop,
+            n_mels=self.n_mels,
+            fmax=self.fmax,
+        )
+        pcen = librosa.core.pcen(mel_spec, sr=self.sr)
+        if not self.use_delta_mfcc:
+            return pcen.astype(np.float32)
+        mfcc = librosa.feature.mfcc(S=librosa.power_to_db(mel_spec), n_mfcc=self.n_mfcc)
+        d_mfcc = librosa.feature.delta(mfcc)
+        combo = np.concatenate([pcen, d_mfcc], axis=0)
+        return combo.astype(np.float32)
+
+
+def _extract_feature(audio_path: str, extractor: FeatureExtractor, conf) -> np.ndarray:
+    y, _ = librosa.load(audio_path, sr=conf.features.sr)
+    # scaling audio as per librosa docs
+    y = y * (2 ** 32)
+    pcen = extractor.extract_feature(y)
+    return pcen.T
+
+
+def feature_transform(conf, mode: str = 'train'):
+    # main feature extraction entry
+    fps = conf.features.sr / conf.features.hop_mel
+    seg_len = int(round(conf.features.seg_len * fps))
+    hop_seg = int(round(conf.features.hop_seg * fps))
+    extension = "*.csv"
+    use_delta_mfcc = bool(conf.features.get("use_delta_mfcc", False))
+    n_mfcc = int(conf.features.get("n_mfcc", 0)) if use_delta_mfcc else 0
+    feat_dim = int(conf.features.n_mels) + n_mfcc
+
+    extractor = FeatureExtractor(conf)
+
+    if mode == 'train':
+        print("=== Processing training set ===")
+        meta_path = conf.path.train_dir
+        all_csv_files = [
+            file
+            for path_dir, _, _ in os.walk(meta_path)
+            for file in glob(os.path.join(path_dir, extension))
+        ]
+        # optional cap for quick runs
+        train_limit = conf.features.get("train_limit")
+        if train_limit is not None and int(train_limit) > 0:
+            all_csv_files = all_csv_files[:int(train_limit)]
+        hdf_tr = os.path.join(conf.path.feat_train, 'Mel_train.h5')
+        hf = h5py.File(hdf_tr, 'w')
+        hf.create_dataset(
+            'features',
+            shape=(0, seg_len, feat_dim),
+            maxshape=(None, seg_len, feat_dim),
+        )
+        label_tr: List[List[str]] = []
+
+        for file in all_csv_files:
+            split_list = file.split('/')
+            glob_cls_name = split_list[split_list.index('Training_Set') + 1]
+            file_name = split_list[split_list.index('Training_Set') + 2]
+            df = pd.read_csv(file, header=0, index_col=False)
+            audio_path = file.replace('csv', 'wav')
+            print("Processing file name {}".format(audio_path))
+
+            pcen = _extract_feature(audio_path, extractor, conf)
+            df_pos = df[(df == 'POS').any(axis=1)]
+            label_list = _create_patches(df_pos, pcen, glob_cls_name, file_name, hf, seg_len, hop_seg, fps)
+            label_tr.append(label_list)
+
+        print(" Feature extraction for training set complete")
+        num_extract = len(hf['features'])
+        flat_list = [item for sublist in label_tr for item in sublist]
+        hf.create_dataset('labels', data=[s.encode() for s in flat_list], dtype='S20')
+        data_shape = hf['features'].shape
+        hf.close()
+        return num_extract, data_shape
+
+    if mode == 'eval':
+        print("=== Processing Validation set ===")
+        meta_path = conf.path.eval_dir
+        all_csv_files = [
+            file
+            for path_dir, _, _ in os.walk(meta_path)
+            for file in glob(os.path.join(path_dir, extension))
+        ]
+        num_extract = 0
+
+        for file in all_csv_files:
+            split_list = file.split('/')
+            eval_file_name = split_list[split_list.index('Validation_Set') + 1]
+            eval_file_name = eval_file_name + "/" + split_list[split_list.index('Validation_Set') + 2]
+            hdf_eval = os.path.join(conf.path.feat_eval, eval_file_name.replace('csv', 'h5'))
+            os.makedirs(os.path.dirname(hdf_eval), exist_ok=True)
+            hf = h5py.File(hdf_eval, 'w')
+
+            audio_path = file.replace('csv', 'wav')
+            pcen = _extract_feature(audio_path, extractor, conf)
+
+            df_eval = pd.read_csv(file, header=0, index_col=False)
+            start_time = df_eval['Starttime'].values.astype(float)
+            end_time = df_eval['Endtime'].values.astype(float)
+            label_list = df_eval['Q'].values
+
+            index_sup = np.where(label_list == 'POS')[0][:conf.train.n_shot]
+            if len(index_sup) == 0:
+                hf.close()
+                continue
+            avg_shot_len = float(np.mean(end_time[index_sup] - start_time[index_sup]))
+            max_len = max(end_time[index_sup] - start_time[index_sup])
+            max_len_frames = int(round(max_len * fps))
+            seglen_lim = int(conf.eval.get("test_seglen_len_lim", 30))
+            if max_len_frames < 8:
+                seg_len_eval = 8
+            elif max_len_frames < seglen_lim:
+                seg_len_eval = max_len_frames
+            elif max_len_frames <= seglen_lim * 2:
+                seg_len_eval = max_len_frames // 2
+            elif max_len_frames < 500:
+                seg_len_eval = max_len_frames // 4
+            else:
+                seg_len_eval = max_len_frames // 8
+            # keep eval patches at least as long as training patches to avoid pooling collapse
+            seg_len_eval = max(seg_len_eval, seg_len)
+            if seg_len_eval <= 0:
+                hf.close()
+                continue
+            hop_div = int(conf.eval.get("test_hoplen_fenmu", 3))
+            hop_seg_eval = max(int(round(seg_len_eval / hop_div)), 1)
+
+            print("Segment length for file is {}".format(seg_len_eval))
+            print("Creating negative dataset")
+            print("Creating Positive dataset")
+            print("Creating query dataset")
+
+            hf.create_dataset('feat_pos', shape=(0, seg_len_eval, feat_dim), maxshape=(None, seg_len_eval, feat_dim))
+            hf.create_dataset('feat_neg', shape=(0, seg_len_eval, feat_dim), maxshape=(None, seg_len_eval, feat_dim))
+            hf.create_dataset('feat_query', shape=(0, seg_len_eval, feat_dim), maxshape=(None, seg_len_eval, feat_dim))
+            hf.create_dataset('avg_shot_len', data=[avg_shot_len])
+
+            def _tile_to_len(arr: np.ndarray, target_len: int) -> np.ndarray | None:
+                # pad short segments by tiling to target length
+                if arr.shape[0] == 0:
+                    return None
+                if arr.shape[0] < target_len:
+                    repeat_num = int(target_len / arr.shape[0]) + 1
+                    arr = np.tile(arr, (repeat_num, 1))
+                    arr = arr[:target_len]
+                return arr
+
+            support_intervals = []
+            for idx in index_sup:
+                start_idx = int(round(start_time[idx] * fps))
+                end_idx = int(round(end_time[idx] * fps))
+                support_intervals.append((start_idx, end_idx))
+            support_intervals.sort(key=lambda x: x[0])
+
+            end_limit = int(round(end_time[index_sup[-1]] * fps))
+            gap_intervals = []
+            curr = 0
+            for start_idx, end_idx in support_intervals:
+                if curr >= end_limit:
+                    break
+                if start_idx > curr:
+                    gap_end = min(start_idx, end_limit)
+                    if gap_end > curr:
+                        gap_intervals.append((curr, gap_end))
+                curr = max(curr, end_idx)
+
+            # support features
+            for index in range(len(index_sup)):
+                start_idx = int(round(start_time[index_sup[index]] * fps))
+                end_idx = int(round(end_time[index_sup[index]] * fps))
+                if end_idx - start_idx > seg_len_eval:
+                    while start_idx + seg_len_eval <= end_idx:
+                        spec = pcen[start_idx:start_idx + seg_len_eval]
+                        start_idx += hop_seg_eval
+                        hf['feat_pos'].resize((hf['feat_pos'].shape[0] + 1), axis=0)
+                        hf['feat_pos'][-1] = spec
+                else:
+                    if end_idx - start_idx > 0:
+                        spec = pcen[start_idx:end_idx]
+                        spec = _tile_to_len(spec, seg_len_eval)
+                        if spec is not None:
+                            hf['feat_pos'].resize((hf['feat_pos'].shape[0] + 1), axis=0)
+                            hf['feat_pos'][-1] = spec
+
+            # negative features from gaps between support events
+            # pcen is time x mels here
+            last_frame = pcen.shape[0]
+            for gap_start, gap_end in gap_intervals:
+                if gap_end <= gap_start:
+                    continue
+                if gap_end - gap_start >= seg_len_eval:
+                    shift = 0
+                    while gap_start + shift + seg_len_eval <= gap_end:
+                        spec = pcen[gap_start + shift:gap_start + shift + seg_len_eval]
+                        hf['feat_neg'].resize((hf['feat_neg'].shape[0] + 1), axis=0)
+                        hf['feat_neg'][-1] = spec
+                        shift = shift + hop_seg_eval
+                    last_patch = pcen[gap_end - seg_len_eval:gap_end]
+                    hf['feat_neg'].resize((hf['feat_neg'].shape[0] + 1), axis=0)
+                    hf['feat_neg'][-1] = last_patch
+                else:
+                    spec = pcen[gap_start:gap_end]
+                    spec = _tile_to_len(spec, seg_len_eval)
+                    if spec is not None:
+                        hf['feat_neg'].resize((hf['feat_neg'].shape[0] + 1), axis=0)
+                        hf['feat_neg'][-1] = spec
+
+            if hf['feat_neg'].shape[0] == 0:
+                print(f"Warning: no negative gaps found for {audio_path}; skipping file.")
+                hf.close()
+                continue
+
+            # query features after the shots
+            strt_index_query = int(round(end_time[index_sup[-1]] * fps))
+            hf.create_dataset('start_index_query', data=[strt_index_query])
+            curr_frame = strt_index_query
+
+            while curr_frame + seg_len_eval <= last_frame:
+                spec = pcen[curr_frame:curr_frame + seg_len_eval]
+                hf['feat_query'].resize((hf['feat_query'].shape[0] + 1), axis=0)
+                hf['feat_query'][-1] = spec
+                curr_frame = curr_frame + hop_seg_eval
+
+            num_extract = num_extract + len(hf['feat_query'])
+            hf.create_dataset('hop_seg', data=[hop_seg_eval])
+            hf.close()
+
+        return num_extract
+
+    raise ValueError("mode must be 'train' or 'eval'")

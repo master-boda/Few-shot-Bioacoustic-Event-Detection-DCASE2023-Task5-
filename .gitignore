@@ -1,0 +1,22 @@
+data/
+Features/
+Model/
+outputs/
+__pycache__/
+*.h5
+*.pth
+*.pt
+*.zip
+paper/*.aux
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.synctex.gz
+paper/*.pdf
+.goutputstream-*
+
+# run artifacts
+Evaluation_report_*.json
+eval_output.csv
+new_eval_output.csv
+score_t*/
